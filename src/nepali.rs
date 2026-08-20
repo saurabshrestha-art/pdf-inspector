@@ -33,6 +33,7 @@ use crate::nepali_tables::{FONTASY_HIMALI, KANTIPUR, PCS_NEPALI, POST_RULES, PRE
 const VIRAMA: char = '\u{094D}';
 const RA: char = '\u{0930}';
 const I_MATRA: char = '\u{093F}';
+const DANDA: char = '\u{0964}';
 
 type LegacyTable = &'static [(u8, &'static str)];
 
@@ -179,11 +180,43 @@ pub(crate) fn apply_post_rules(text: &str) -> String {
                     mapped = std::borrow::Cow::Owned(rewritten);
                 }
             }
-            out.push_str(&mapped);
+            out.push_str(&restore_decimal_points(&mapped));
         }
         out.push_str(trailing);
     }
     out
+}
+
+/// Put back the decimal points the keyboard tables turn into dandas.
+///
+/// On these layouts the period key types `।`, which is right for ending a
+/// sentence and wrong inside a number: the tariff's rates are typed `19.78`
+/// and print `१९.७८`, but decode to `१९।७८`. A danda is sentence-final
+/// punctuation and never separates two digits, so a danda with a digit on each
+/// side is always a decimal point that was mapped through the wrong key.
+fn restore_decimal_points(text: &str) -> String {
+    if !text.contains(DANDA) {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let flanked = i > 0
+                && is_decimal_digit(chars[i - 1])
+                && chars.get(i + 1).copied().is_some_and(is_decimal_digit);
+            if c == DANDA && flanked {
+                '.'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+fn is_decimal_digit(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, '\u{0966}'..='\u{096F}')
 }
 
 /// cp1252 reading of a byte, for the codes the tables leave unmapped.
@@ -661,6 +694,17 @@ mod tests {
         assert_eq!(preeti(b"gLlt"), "नीति");
         // 'Q' is the त्त conjunct, so the matra hops the whole cluster.
         assert_eq!(preeti(b"ljQ"), "वित्त");
+    }
+
+    #[test]
+    fn danda_between_digits_is_a_decimal_point() {
+        // "19.78" typed on the Himali layout: the digits become Devanagari and
+        // the period key would otherwise land as a sentence-ending danda.
+        let table = legacy_table("FontasyHimali").unwrap();
+        assert_eq!(apply_post_rules(&decode_legacy(b"19.78", table)), "१९.७८");
+        // A danda that actually ends a sentence is left alone.
+        assert_eq!(restore_decimal_points("यो हो ।"), "यो हो ।");
+        assert_eq!(restore_decimal_points("१९।७८ र २४।३० ।"), "१९.७८ र २४.३० ।");
     }
 
     #[test]
