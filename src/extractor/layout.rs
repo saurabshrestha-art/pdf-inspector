@@ -1001,7 +1001,84 @@ fn validate_and_build_columns(
         x_max,
     });
 
-    columns
+    fold_list_marker_columns(columns, page_items, x_max - x_min)
+}
+
+/// Widest a column may be and still be read as nothing but list markers.
+const MAX_MARKER_COLUMN_FRACTION: f32 = 0.08;
+
+/// Fold a column of bare list markers into the text it introduces.
+///
+/// A bullet glyph sits in its own narrow x-band, so the projection profile
+/// finds a gutter on each side of it and reports three columns where a reader
+/// sees two: text, markers, text. The valley-level guard cannot catch this —
+/// it weighs everything left of a gutter against everything right of it, so a
+/// marker band in the middle of the page is never the smaller side of either
+/// gutter. Three columns then fail the two-column reading policy and the page
+/// falls back to Y-sorting, which interleaves the two text columns line by
+/// line.
+///
+/// Markers precede their text, so a folded band joins the column to its right,
+/// except at the page edge where only a left neighbour exists.
+fn fold_list_marker_columns(
+    columns: Vec<ColumnRegion>,
+    page_items: &[&TextItem],
+    page_width: f32,
+) -> Vec<ColumnRegion> {
+    if columns.len() < 2 || page_width <= 0.0 {
+        return columns;
+    }
+    let max_width = page_width * MAX_MARKER_COLUMN_FRACTION;
+
+    let marker_only: Vec<bool> = columns
+        .iter()
+        .map(|column| {
+            if column.x_max - column.x_min > max_width {
+                return false;
+            }
+            let inside: Vec<&&TextItem> = page_items
+                .iter()
+                .filter(|item| {
+                    let center = item.x + effective_width(item) / 2.0;
+                    center >= column.x_min && center < column.x_max
+                })
+                .collect();
+            !inside.is_empty() && is_list_marker_column(&inside)
+        })
+        .collect();
+
+    if !marker_only.iter().any(|&m| m) {
+        return columns;
+    }
+
+    let mut folded: Vec<ColumnRegion> = Vec::with_capacity(columns.len());
+    let mut carried: Option<f32> = None;
+    for (index, column) in columns.iter().enumerate() {
+        if marker_only[index] && index + 1 < columns.len() {
+            carried = Some(carried.unwrap_or(column.x_min));
+            continue;
+        }
+        let x_min = carried.take().unwrap_or(column.x_min);
+        if marker_only[index] {
+            // Trailing marker band: nothing to its right, so widen the
+            // previous column instead of leaving a text-free region.
+            if let Some(previous) = folded.last_mut() {
+                previous.x_max = column.x_max;
+                continue;
+            }
+        }
+        folded.push(ColumnRegion {
+            x_min,
+            x_max: column.x_max,
+        });
+    }
+
+    debug!(
+        "  folded {} list-marker column(s); {} columns remain",
+        columns.len() - folded.len(),
+        folded.len()
+    );
+    folded
 }
 
 /// Identify items that belong to lines spanning across detected columns.
