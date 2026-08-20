@@ -264,6 +264,8 @@ pub(crate) fn devanagari_glyph_map(font_data: &[u8]) -> Option<HashMap<u16, Stri
         return None;
     }
 
+    remap_disguised_latin_digits(&face, &mut resolved);
+
     let (ligatures, single_sources) = collect_gsub_reversals(&face);
 
     // Conjunct glyphs carry no codepoint, so they are absent from the map above
@@ -277,6 +279,88 @@ pub(crate) fn devanagari_glyph_map(font_data: &[u8]) -> Option<HashMap<u16, Stri
     resolved.extend(derived);
 
     Some(resolved)
+}
+
+/// Outline metrics used to tell whether two glyph slots hold the same drawing.
+type GlyphMetrics = (u16, ttf_parser::Rect);
+
+/// How many of the ten digit slots must match before the Latin row is judged a
+/// disguise. A font could coincidentally match one or two; matching most of the
+/// row only happens when the slots really do hold the same drawings.
+const DISGUISED_DIGIT_QUORUM: usize = 7;
+
+/// Repoint Latin digit slots that actually contain Devanagari digits.
+///
+/// Some Devanagari fonts fill their `zero`–`nine` slots with Devanagari
+/// outlines, so a PDF that asks for the `two` glyph prints `२` while the cmap
+/// still reports U+0032. Extraction that trusts the cmap emits `८2` for a page
+/// that plainly reads `८२` — right value, wrong script.
+///
+/// A slot is a disguise when its advance and bounding box match its Devanagari
+/// counterpart: a genuine Latin digit is far narrower than a Devanagari one and
+/// lacks the headline bar, so the boxes disagree well beyond the tolerance.
+/// The whole row has to agree before any of it is rewritten.
+fn remap_disguised_latin_digits(face: &ttf_parser::Face<'_>, resolved: &mut HashMap<u16, String>) {
+    let units_per_em = f32::from(face.units_per_em());
+    if units_per_em <= 0.0 {
+        return;
+    }
+    let tolerance = units_per_em / 50.0;
+
+    let mut candidates: Vec<(u16, char)> = Vec::new();
+    for offset in 0..10u32 {
+        let (Some(latin), Some(devanagari)) = (
+            char::from_u32('0' as u32 + offset),
+            char::from_u32(0x0966 + offset),
+        ) else {
+            continue;
+        };
+        let (Some(latin_gid), Some(devanagari_gid)) =
+            (face.glyph_index(latin), face.glyph_index(devanagari))
+        else {
+            continue;
+        };
+        if latin_gid == devanagari_gid {
+            continue; // Already one slot; nothing to repoint.
+        }
+        let (Some(latin_metrics), Some(devanagari_metrics)) = (
+            glyph_metrics(face, latin_gid),
+            glyph_metrics(face, devanagari_gid),
+        ) else {
+            continue;
+        };
+        if metrics_match(latin_metrics, devanagari_metrics, tolerance) {
+            candidates.push((latin_gid.0, devanagari));
+        }
+    }
+
+    if candidates.len() >= DISGUISED_DIGIT_QUORUM {
+        for (gid, devanagari) in candidates {
+            resolved.insert(gid, devanagari.to_string());
+        }
+    }
+}
+
+fn glyph_metrics(face: &ttf_parser::Face<'_>, gid: ttf_parser::GlyphId) -> Option<GlyphMetrics> {
+    Some((face.glyph_hor_advance(gid)?, face.glyph_bounding_box(gid)?))
+}
+
+/// Whether two glyphs advance the same and draw the same shape, within
+/// `tolerance` font units.
+///
+/// Compares the size of the bounding box and its vertical placement, but not
+/// its horizontal position: a disguised slot is routinely the same drawing
+/// sitting on a different left side bearing, which shifts `x_min` and `x_max`
+/// together while the shape is untouched. Vertical extent is the discriminating
+/// axis anyway — Devanagari digits hang from a headline bar that Latin ones
+/// have no equivalent of.
+fn metrics_match(left: GlyphMetrics, right: GlyphMetrics, tolerance: f32) -> bool {
+    let close = |a: i16, b: i16| (f32::from(a) - f32::from(b)).abs() <= tolerance;
+    let width = |rect: ttf_parser::Rect| f32::from(rect.x_max) - f32::from(rect.x_min);
+    f32::from(left.0.abs_diff(right.0)) <= tolerance
+        && (width(left.1) - width(right.1)).abs() <= tolerance
+        && close(left.1.y_min, right.1.y_min)
+        && close(left.1.y_max, right.1.y_max)
 }
 
 type GsubReversals = (HashMap<u16, Vec<u16>>, HashMap<u16, u16>);
@@ -663,6 +747,35 @@ mod tests {
         for font in ["Kruti Dev 010", "DevLys 010", "Chanakya", "Shusha", "AGRA"] {
             assert!(legacy_table(font).is_none(), "{font}");
         }
+    }
+
+    /// The digit-disguise test has to accept a slot that is the same drawing
+    /// and reject one that merely sits nearby. A real Latin digit in a
+    /// Devanagari font is markedly narrower and has no headline bar.
+    #[test]
+    fn metrics_match_separates_a_disguise_from_a_real_latin_digit() {
+        let rect = |x_min, y_min, x_max, y_max| ttf_parser::Rect {
+            x_min,
+            y_min,
+            x_max,
+            y_max,
+        };
+        let tolerance = 2048.0 / 50.0;
+        // Kalimati's uni0968 and its `two` slot: same drawing, shifted 30 units
+        // by a different side bearing, one unit apart in advance.
+        let devanagari = (1486, rect(173, -143, 1190, 1577));
+        let disguise = (1485, rect(203, -143, 1220, 1577));
+        assert!(metrics_match(disguise, devanagari, tolerance));
+        // The same font's `eight`, shifted 110 units — still the same drawing.
+        assert!(metrics_match(
+            (1485, rect(203, 82, 1489, 1372)),
+            (1485, rect(93, 82, 1379, 1372)),
+            tolerance
+        ));
+        // A genuine Latin digit: narrower advance, narrower box, and no
+        // headline bar, so it fails on every axis that matters.
+        let latin = (1000, rect(60, 0, 900, 950));
+        assert!(!metrics_match(latin, devanagari, tolerance));
     }
 
     #[test]

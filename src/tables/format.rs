@@ -170,12 +170,6 @@ fn is_dots_only(cell: &str) -> bool {
     dots >= 3 && t.chars().all(|c| c == '.' || c.is_whitespace())
 }
 
-fn starts_with_uppercase_word(cell: &str) -> bool {
-    cell.chars()
-        .find(|c| c.is_alphanumeric())
-        .is_some_and(|c| c.is_uppercase())
-}
-
 fn starts_with_uppercase_alpha(cell: &str) -> bool {
     cell.chars()
         .find(|c| c.is_alphabetic())
@@ -188,9 +182,46 @@ fn starts_with_lowercase_alpha(cell: &str) -> bool {
         .is_some_and(|c| c.is_lowercase())
 }
 
+/// A decimal digit in either of the scripts this parser numbers rows in.
+///
+/// Devanagari tables label rows `२२`, `४१`; `is_ascii_digit` sees none of it, so
+/// every numeric test silently reports zero and the row reads as prose.
+fn is_decimal_digit(c: char) -> bool {
+    c.is_ascii_digit() || matches!(c, '\u{0966}'..='\u{096F}')
+}
+
+/// Whether a cell opens the way a label does rather than mid-sentence.
+///
+/// Latin separates a label from running prose by capitalisation. Caseless
+/// scripts — Devanagari, Arabic, CJK — carry no such signal, and `is_uppercase`
+/// answers false for every one of their letters; read literally that says
+/// "never a label", which is what collapses a Devanagari table into a single
+/// row. A leading letter that has no case at all therefore counts as a label
+/// opener. Latin is unaffected: its letters are always one case or the other,
+/// so the extra arm can never fire for them.
+fn starts_like_label(cell: &str) -> bool {
+    cell.chars()
+        .find(|c| c.is_alphabetic())
+        .is_some_and(|c| c.is_uppercase() || !c.is_lowercase())
+}
+
+/// [`starts_like_label`] over alphanumerics rather than letters.
+fn starts_like_label_word(cell: &str) -> bool {
+    cell.chars()
+        .find(|c| c.is_alphanumeric())
+        .is_some_and(|c| c.is_uppercase() || (c.is_alphabetic() && !c.is_lowercase()))
+}
+
+/// A cell holding nothing but a short number, in either script — the shape of a
+/// row number or a page reference.
+fn is_bare_number(cell: &str) -> bool {
+    let trimmed = cell.trim();
+    (1..=4).contains(&trimmed.chars().count()) && trimmed.chars().all(is_decimal_digit)
+}
+
 fn starts_with_numbered_label(cell: &str) -> bool {
     let trimmed = cell.trim_start();
-    let digit_count = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+    let digit_count = trimmed.chars().take_while(|c| is_decimal_digit(*c)).count();
 
     digit_count > 0
         && digit_count <= 3
@@ -209,9 +240,7 @@ fn starts_with_hierarchical_numbered_label(cell: &str) -> bool {
     let levels: Vec<&str> = token.split('.').collect();
     (2..=4).contains(&levels.len())
         && levels.iter().all(|level| {
-            !level.is_empty()
-                && level.len() <= 3
-                && level.chars().all(|character| character.is_ascii_digit())
+            !level.is_empty() && level.chars().count() <= 3 && level.chars().all(is_decimal_digit)
         })
 }
 
@@ -223,11 +252,14 @@ fn alpha_word_count(cell: &str) -> usize {
 
 fn looks_like_compact_entry_label(cell: &str) -> bool {
     let trimmed = cell.trim();
-    if trimmed.len() < 3 || trimmed.len() > 80 {
+    // Counted in characters, not bytes: a Devanagari character is three bytes,
+    // so a byte cap of 80 admits only about 26 of them.
+    let length = trimmed.chars().count();
+    if !(3..=80).contains(&length) {
         return false;
     }
 
-    if !starts_with_uppercase_alpha(trimmed) && !starts_with_numbered_label(trimmed) {
+    if !starts_like_label(trimmed) && !starts_with_numbered_label(trimmed) {
         return false;
     }
 
@@ -313,15 +345,17 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
         let avg_cell_len = if non_first_cells.is_empty() {
             0.0
         } else {
-            non_first_cells.iter().map(|c| c.len()).sum::<usize>() as f32
+            non_first_cells
+                .iter()
+                .map(|c| c.chars().count())
+                .sum::<usize>() as f32
                 / non_first_cells.len() as f32
         };
         let numeric_cells = non_first_cells
             .iter()
             .filter(|c| {
-                c.chars().all(|ch| {
-                    ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == ',' || ch == ' '
-                })
+                c.chars()
+                    .all(|ch| is_decimal_digit(ch) || matches!(ch, '.' | '-' | ',' | ' '))
             })
             .count();
         let looks_like_data_row = non_first_cells.len() >= 2
@@ -329,7 +363,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && numeric_cells > non_first_cells.len() / 2;
         let uppercase_leading_cells = non_first_cells
             .iter()
-            .filter(|cell| starts_with_uppercase_word(cell))
+            .filter(|cell| starts_like_label_word(cell))
             .count();
         let first_non_empty_col = row.iter().position(|c| !c.trim().is_empty());
         let first_non_empty_cell = first_non_empty_col
@@ -341,7 +375,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
                 row.iter()
                     .skip(idx + 1)
                     .map(|c| c.trim())
-                    .filter(|c| !c.is_empty() && starts_with_uppercase_alpha(c))
+                    .filter(|c| !c.is_empty() && starts_like_label(c))
                     .count()
             })
             .unwrap_or(0);
@@ -386,6 +420,27 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && filled_cells == 1
             && header_filled >= 3
             && looks_like_plain_section_label(first_cell);
+        // A contents line: the spanned first column is blank, but the row opens
+        // with a bare entry number and closes with a bare page number, with its
+        // title in between. Text wrapped from the row above never carries both
+        // of those, so this row starts a new entry however long its title runs.
+        // Without it, only rows whose title is short enough for
+        // `looks_like_data_row` survive, and a contents page collapses into a
+        // handful of rows with every title concatenated.
+        let last_filled_cell = row
+            .iter()
+            .map(|c| c.trim())
+            .rfind(|c| !c.is_empty())
+            .unwrap_or("");
+        let looks_like_numbered_entry_row = first_cell.is_empty()
+            && filled_cells >= 3
+            && first_non_empty_col == Some(1)
+            && is_bare_number(first_non_empty_cell)
+            && is_bare_number(last_filled_cell)
+            && non_first_cells
+                .iter()
+                .any(|cell| cell.chars().any(char::is_alphabetic));
+
         // Classic continuation: first cell empty, content in other cells
         let is_classic_continuation = first_cell.is_empty()
             && !non_first_cells.is_empty()
@@ -393,6 +448,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && !looks_like_data_row
             && !looks_like_spanning_first_column_row
             && !looks_like_hierarchical_subrow
+            && !looks_like_numbered_entry_row
             && cleaned.len() > 1;
 
         // Wrapped-cell continuation: row has fewer filled cells than the header
@@ -423,6 +479,7 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             && !looks_like_spanning_first_column_row
             && !looks_like_hierarchical_subrow
             && !looks_like_new_first_column_entry
+            && !looks_like_numbered_entry_row
             && !looks_like_section_label_row
             && !is_short_subheader;
 
