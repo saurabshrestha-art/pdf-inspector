@@ -245,6 +245,29 @@ pub(crate) fn extract_page_text_items(
         }
     }
 
+    // Fonts whose text arrives in drawn order rather than logical order. Kept as
+    // item-font names so the reordering pass can find them after merge, which is
+    // the first point at which a Devanagari word is whole.
+    let visual_order_fonts: std::collections::HashSet<String> = fonts
+        .keys()
+        .filter_map(|font_name| {
+            let resource_name = String::from_utf8_lossy(font_name).to_string();
+            if !crate::extractor::fonts::font_decodes_devanagari_visual_order(
+                &resource_name,
+                font_cmaps,
+                &font_tounicode_refs,
+                &inline_cmaps,
+            ) {
+                return None;
+            }
+            let base_font = font_base_names
+                .get(&resource_name)
+                .map(|s| s.as_str())
+                .unwrap_or(&resource_name);
+            Some(crate::extractor::fonts::item_font_name(&resource_name, base_font).to_string())
+        })
+        .collect();
+
     let mut cmap_decisions = CMapDecisionCache::new();
 
     // Get XObjects (images) from page resources
@@ -1439,7 +1462,17 @@ pub(crate) fn extract_page_text_items(
         page_num,
     );
 
-    let items = super::merge_text_items(items);
+    let mut items = super::merge_text_items(items);
+    // Now that fragments are joined into words, put the drawn order back into
+    // logical order. Gated on provenance: the pass is not idempotent, and a
+    // `/ToUnicode` result is already logical.
+    if !visual_order_fonts.is_empty() {
+        for item in &mut items {
+            if visual_order_fonts.contains(&item.font) {
+                item.text = crate::nepali::reorder_devanagari(&item.text);
+            }
+        }
+    }
     let items = super::merge_subscript_items(items);
     Ok((
         (items, rects, lines),

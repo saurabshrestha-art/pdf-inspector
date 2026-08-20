@@ -1097,11 +1097,23 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 let needs_bullet_space = *preserve_stream_order
                     && is_standalone_bullet_text(&text)
                     && !next.text.trim().is_empty();
+                // A combining mark belongs to the character before it, whatever
+                // the gap says. Devanagari fonts routinely draw a matra as its
+                // own positioned run, and a space wedged in front detaches it
+                // from its syllable: "कृ" + "ि" + "ष" must not become "कृ िष".
+                let joins_combining_mark = next
+                    .text
+                    .chars()
+                    .next()
+                    .is_some_and(crate::nepali::is_combining_mark);
                 let effective_threshold = match tracked {
                     Some((run_end, floor)) if j <= run_end => floor,
                     _ => threshold,
                 };
-                if !small_caps_join && (needs_bullet_space || gap > effective_threshold) {
+                if !small_caps_join
+                    && !joins_combining_mark
+                    && (needs_bullet_space || gap > effective_threshold)
+                {
                     text.push(' ');
                 }
                 text.push_str(&next.text);

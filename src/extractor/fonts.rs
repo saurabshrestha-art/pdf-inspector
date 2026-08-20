@@ -1151,6 +1151,28 @@ fn font_file_data(doc: &Document, ff_ref: ObjectId) -> Option<Vec<u8>> {
     )
 }
 
+/// Whether a font resource decodes glyph ids straight to Devanagari, and so
+/// yields text in the order the glyphs are drawn rather than logical order.
+///
+/// The reordering pass keys on this. It cannot run at decode time: a Devanagari
+/// cluster is routinely split across two text-show operators, and reordering
+/// half of one strands its matra. So the flag travels to item-merge time, where
+/// whole words exist.
+pub(crate) fn font_decodes_devanagari_visual_order(
+    resource_name: &str,
+    font_cmaps: &FontCMaps,
+    font_tounicode_refs: &std::collections::HashMap<String, u32>,
+    inline_cmaps: &std::collections::HashMap<String, crate::tounicode::CMapEntry>,
+) -> bool {
+    if let Some(entry) = inline_cmaps.get(resource_name) {
+        return entry.primary.devanagari_visual_order;
+    }
+    font_tounicode_refs
+        .get(resource_name)
+        .and_then(|obj_num| font_cmaps.get_by_obj(*obj_num))
+        .is_some_and(|entry| entry.primary.devanagari_visual_order)
+}
+
 /// Decode text from a PDF string operand using font CMaps, encodings, and fallbacks.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn extract_text_from_operand(

@@ -29,7 +29,8 @@ pub struct ToUnicodeCMap {
     pub cid_passthrough: bool,
     /// When true, this map resolves glyph ids straight to Devanagari, so a
     /// decoded run comes out in the order the glyphs are *drawn* rather than the
-    /// order Unicode stores them. Decoding then finishes with a reordering pass.
+    /// order Unicode stores them. Extraction reorders such runs once items are
+    /// merged into words; see `fonts::font_decodes_devanagari_visual_order`.
     /// Only ever set on maps built from a font's own tables — a `/ToUnicode`
     /// result is logical by definition and reordering it would corrupt it.
     pub devanagari_visual_order: bool,
@@ -516,14 +517,6 @@ impl ToUnicodeCMap {
         };
         if total > 0 && unmapped_count > total / 2 {
             return String::new();
-        }
-
-        if self.devanagari_visual_order {
-            // ponytail: reorders one operand's worth of glyphs. A cluster split
-            // across two text-show operators keeps its matra on the wrong side;
-            // fixing that needs the reorder deferred to item merge, which in
-            // turn needs the provenance flag carried on the item.
-            return crate::nepali::reorder_devanagari(&result);
         }
 
         result

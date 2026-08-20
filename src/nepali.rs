@@ -585,7 +585,7 @@ fn cluster_start(out: &[char]) -> usize {
     i
 }
 
-fn is_combining_mark(c: char) -> bool {
+pub(crate) fn is_combining_mark(c: char) -> bool {
     matches!(c, '\u{0900}'..='\u{0903}' | '\u{093A}'..='\u{094F}' | '\u{0951}'..='\u{0957}')
 }
 
