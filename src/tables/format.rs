@@ -212,11 +212,19 @@ fn starts_like_label_word(cell: &str) -> bool {
         .is_some_and(|c| c.is_uppercase() || (c.is_alphabetic() && !c.is_lowercase()))
 }
 
-/// A cell holding nothing but a short number, in either script — the shape of a
-/// row number or a page reference.
-fn is_bare_number(cell: &str) -> bool {
+/// A cell holding nothing but a number or a numeric code, in either script.
+///
+/// Covers the shapes that open and close a schedule row: a row number (`२२`), a
+/// page reference (`७३`), a tariff code (`१३०२.३१.००`) and a rate (`१९।७८`, which
+/// uses a danda as its decimal point). Anything carrying a letter is excluded,
+/// which is what keeps prose that wrapped out of the row above from qualifying.
+fn is_numeric_code(cell: &str) -> bool {
     let trimmed = cell.trim();
-    (1..=4).contains(&trimmed.chars().count()) && trimmed.chars().all(is_decimal_digit)
+    (1..=16).contains(&trimmed.chars().count())
+        && trimmed.chars().any(is_decimal_digit)
+        && trimmed
+            .chars()
+            .all(|c| is_decimal_digit(c) || matches!(c, '.' | ',' | '-' | '/' | '\u{0964}'))
 }
 
 fn starts_with_numbered_label(cell: &str) -> bool {
@@ -432,11 +440,24 @@ fn clean_table_cells(cells: &[Vec<String>]) -> (Vec<Vec<String>>, Vec<String>) {
             .map(|c| c.trim())
             .rfind(|c| !c.is_empty())
             .unwrap_or("");
+        // Either the row carries its values — a number in, a number out — or it
+        // opens with something that reads as an identifier rather than a value.
+        // The second arm matters where a description wraps and pushes the rates
+        // onto a later line, leaving the code row with only a code and a title.
+        //
+        // Dotted and undivided runs (`1302.32.00`) identify; comma-grouped ones
+        // (`79,287,000`) are money, and money is what a wrapped price cell
+        // starts with — so grouping commas disqualify the arm.
+        let reads_as_identifier = first_non_empty_cell.chars().count() >= 6
+            && !first_non_empty_cell.contains(',')
+            && first_non_empty_cell.contains('.');
+        let opens_a_schedule_entry =
+            (filled_cells >= 3 && is_numeric_code(last_filled_cell)) || reads_as_identifier;
         let looks_like_numbered_entry_row = first_cell.is_empty()
-            && filled_cells >= 3
+            && filled_cells >= 2
             && first_non_empty_col == Some(1)
-            && is_bare_number(first_non_empty_cell)
-            && is_bare_number(last_filled_cell)
+            && is_numeric_code(first_non_empty_cell)
+            && opens_a_schedule_entry
             && non_first_cells
                 .iter()
                 .any(|cell| cell.chars().any(char::is_alphabetic));
