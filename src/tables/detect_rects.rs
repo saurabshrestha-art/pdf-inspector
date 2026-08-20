@@ -3083,6 +3083,16 @@ fn detect_row_stripe_table_from_cell_rects(
         }
     }
 
+    // A chart's plot furniture supplies plenty of rectangles, and this fallback
+    // will happily derive columns from them and wrap the page's body prose in a
+    // table. The row-stripe detector already refuses that shape; the same test
+    // belongs here, since this path runs after it and would otherwise undo the
+    // refusal.
+    if has_dominant_prose_cell(&cells) {
+        debug!("  cell-rect rejected: dominant prose cell (chart/figure region over body text)");
+        return None;
+    }
+
     let column_centers: Vec<f32> = (0..num_cols)
         .map(|c| (col_edges[c] + col_edges[c + 1]) / 2.0)
         .collect();
