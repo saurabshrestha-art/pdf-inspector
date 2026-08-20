@@ -187,14 +187,17 @@ pub(crate) fn apply_post_rules(text: &str) -> String {
     out
 }
 
-/// Put back the decimal points the keyboard tables turn into dandas.
+/// Put back the decimal points that decode as dandas.
 ///
-/// On these layouts the period key types `।`, which is right for ending a
-/// sentence and wrong inside a number: the tariff's rates are typed `19.78`
-/// and print `१९.७८`, but decode to `१९।७८`. A danda is sentence-final
-/// punctuation and never separates two digits, so a danda with a digit on each
-/// side is always a decimal point that was mapped through the wrong key.
-fn restore_decimal_points(text: &str) -> String {
+/// The keyboard layouts type `।` from the period key, which is right for
+/// ending a sentence and wrong inside a number: the tariff's rates are typed
+/// `19.78` and print `१९.७८`, but decode to `१९।७८`. Devanagari CID fonts
+/// reach the same place by their own route, mapping the glyph to U+0964 in
+/// their cmap, so this runs on every item rather than only on legacy ones.
+///
+/// A danda is sentence-final punctuation and never separates two digits, so a
+/// danda with a digit on each side is always a decimal point.
+pub(crate) fn restore_decimal_points(text: &str) -> String {
     if !text.contains(DANDA) {
         return text.to_string();
     }

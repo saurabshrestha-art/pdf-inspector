@@ -1156,6 +1156,10 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         if crate::nepali::legacy_table(&item.font).is_some() {
             item.text = crate::nepali::apply_post_rules(&item.text);
         }
+        // Not gated on the legacy path: a Devanagari CID font reaches the same
+        // wrong reading through its own cmap. Cheap to ask, since the check
+        // exits immediately unless the text holds a danda at all.
+        item.text = crate::nepali::restore_decimal_points(&item.text);
     }
 
     merged
