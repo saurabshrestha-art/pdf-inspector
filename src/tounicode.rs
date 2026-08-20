@@ -27,6 +27,12 @@ pub struct ToUnicodeCMap {
     /// When true, unmapped CIDs are interpreted as Unicode codepoints directly.
     /// Used as a last resort for Identity-H fonts without ToUnicode/cmap/glyph names.
     pub cid_passthrough: bool,
+    /// When true, this map resolves glyph ids straight to Devanagari, so a
+    /// decoded run comes out in the order the glyphs are *drawn* rather than the
+    /// order Unicode stores them. Decoding then finishes with a reordering pass.
+    /// Only ever set on maps built from a font's own tables — a `/ToUnicode`
+    /// result is logical by definition and reordering it would corrupt it.
+    pub devanagari_visual_order: bool,
 }
 
 pub(crate) fn build_cmap_entry_from_stream(
@@ -37,6 +43,7 @@ pub(crate) fn build_cmap_entry_from_stream(
 ) -> Option<CMapEntry> {
     if let Some(cmap) = ToUnicodeCMap::parse(data) {
         let (mut primary, mut remapped) = try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
+        apply_devanagari_glyph_override(&mut primary, font_dict, doc);
         let mut fallback = build_fallback_tounicode_from_encoding(font_dict, doc)
             .or_else(|| build_fallback_cmap_for_type0(font_dict, doc))
             .or_else(|| build_fallback_cmap_for_simple(font_dict, doc));
@@ -509,6 +516,14 @@ impl ToUnicodeCMap {
         };
         if total > 0 && unmapped_count > total / 2 {
             return String::new();
+        }
+
+        if self.devanagari_visual_order {
+            // ponytail: reorders one operand's worth of glyphs. A cluster split
+            // across two text-show operators keeps its matra on the wrong side;
+            // fixing that needs the reorder deferred to item merge, which in
+            // turn needs the provenance flag carried on the item.
+            return crate::nepali::reorder_devanagari(&result);
         }
 
         result
@@ -2137,6 +2152,7 @@ impl FontCMaps {
                 );
                 let (mut primary, mut remapped) =
                     try_remap_subset_cmap(cmap, font_dict, doc, obj_num);
+                apply_devanagari_glyph_override(&mut primary, font_dict, doc);
 
                 // Only build expensive fallbacks when the primary CMap is sparse.
                 // build_fallback_cmap_for_type0 can take seconds on large embedded
@@ -2532,10 +2548,12 @@ impl FontCMaps {
 
 /// For Type0 CID fonts, try to build a fallback CMap from embedded font data
 /// or CIDSystemInfo when a ToUnicode CMap is present but incomplete.
-fn build_fallback_cmap_for_type0(
-    font_dict: &lopdf::Dictionary,
-    doc: &Document,
-) -> Option<ToUnicodeCMap> {
+/// Walk an Identity-H Type0 font down to its descendant CIDFont and, when the
+/// font program is embedded, its decompressed bytes.
+fn type0_descendant_and_program<'a>(
+    font_dict: &'a lopdf::Dictionary,
+    doc: &'a Document,
+) -> Option<(&'a lopdf::Dictionary, Option<Vec<u8>>)> {
     let subtype = font_dict.get(b"Subtype").ok()?.as_name().ok()?;
     if subtype != b"Type0" {
         return None;
@@ -2548,8 +2566,7 @@ fn build_fallback_cmap_for_type0(
         return None;
     }
 
-    let desc_fonts_obj = font_dict.get(b"DescendantFonts").ok()?;
-    let desc_fonts = match desc_fonts_obj {
+    let desc_fonts = match font_dict.get(b"DescendantFonts").ok()? {
         Object::Array(arr) => arr,
         Object::Reference(r) => match doc.get_object(*r) {
             Ok(Object::Array(arr)) => arr,
@@ -2557,10 +2574,7 @@ fn build_fallback_cmap_for_type0(
         },
         _ => return None,
     };
-    if desc_fonts.is_empty() {
-        return None;
-    }
-    let cid_font_dict = match &desc_fonts[0] {
+    let cid_font_dict = match desc_fonts.first()? {
         Object::Reference(r) => doc.get_dictionary(*r).ok()?,
         Object::Dictionary(d) => d,
         _ => return None,
@@ -2575,37 +2589,113 @@ fn build_fallback_cmap_for_type0(
             _ => None,
         });
 
-    let font_file_ref = font_descriptor.and_then(|fd| {
-        fd.get(b"FontFile2")
-            .ok()
-            .and_then(|o| o.as_reference().ok())
-            .or_else(|| {
-                fd.get(b"FontFile3")
-                    .ok()
-                    .and_then(|o| o.as_reference().ok())
-            })
-    });
+    let program = font_descriptor
+        .and_then(|fd| {
+            fd.get(b"FontFile2")
+                .ok()
+                .and_then(|o| o.as_reference().ok())
+                .or_else(|| {
+                    fd.get(b"FontFile3")
+                        .ok()
+                        .and_then(|o| o.as_reference().ok())
+                })
+        })
+        .and_then(|ff_ref| doc.get_object(ff_ref).and_then(Object::as_stream).ok())
+        .and_then(|stream| stream.decompressed_content().ok());
 
-    if let Some(ff_ref) = font_file_ref {
-        if let Ok(stream) = doc.get_object(ff_ref).and_then(Object::as_stream) {
-            if let Ok(data) = stream.decompressed_content() {
-                if let Some(cmap) = build_cmap_from_truetype(&data) {
-                    if let Some(cid_to_gid) = get_cid_to_gid_map(cid_font_dict, doc) {
-                        if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
-                            debug!(
-                                "Fallback TrueType CMap repaired with CIDToGIDMap: {} entries",
-                                repaired.char_map.len()
-                            );
-                            return Some(repaired);
-                        }
-                    }
+    Some((cid_font_dict, program))
+}
+
+/// Replace a Devanagari CID font's `/ToUnicode` mappings with what the font's
+/// own tables say each glyph is.
+///
+/// Office and DTP pipelines regularly emit a `/ToUnicode` for Devanagari that
+/// was derived from glyph indices instead of the character map. It still
+/// decodes to Devanagari, so no encoding check fires, but letters land on their
+/// neighbours and the text is quietly wrong — far worse than text that is
+/// visibly broken. The font's own cmap and GSUB tables state the truth, so they
+/// win wherever they have an answer; CIDs they cannot resolve keep the
+/// `/ToUnicode` reading.
+///
+/// Parsing an embedded font is expensive, so this is gated twice: the existing
+/// map must already look Devanagari, and the font itself must then confirm it.
+fn apply_devanagari_glyph_override(
+    primary: &mut ToUnicodeCMap,
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+) {
+    let devanagari_entries = primary
+        .char_map
+        .values()
+        .filter(|text| text.chars().any(crate::nepali::is_devanagari_char))
+        .count();
+    if devanagari_entries < DEVANAGARI_OVERRIDE_MIN_ENTRIES {
+        return;
+    }
+
+    let Some((_, Some(program))) = type0_descendant_and_program(font_dict, doc) else {
+        return;
+    };
+    let Some(glyph_map) = crate::nepali::devanagari_glyph_map(&program) else {
+        return;
+    };
+
+    // Only replace a map we can replace *wholesale*. A partial override is the
+    // worst of both worlds: it corrects the glyphs the font can name and leaves
+    // the rest reading the scrambled `/ToUnicode`, so a word can come out with
+    // one letter fixed and its neighbour still wrong. Fonts that subset away
+    // their GSUB table cannot name their own conjuncts and land here.
+    let claimed = primary.char_map.len();
+    let resolvable = primary
+        .char_map
+        .keys()
+        .filter(|gid| glyph_map.contains_key(gid))
+        .count();
+    if resolvable * 100 < claimed * DEVANAGARI_OVERRIDE_MIN_COVERAGE_PCT {
+        debug!(
+            "Devanagari glyph override declined: font names only {resolvable}/{claimed} mapped glyphs"
+        );
+        return;
+    }
+
+    debug!(
+        "Devanagari glyph override: {} glyph entries replacing {claimed} ToUnicode entries",
+        glyph_map.len()
+    );
+    primary.char_map.extend(glyph_map);
+    primary.devanagari_visual_order = true;
+}
+
+/// How much Devanagari a `/ToUnicode` must already show before it is worth
+/// parsing the embedded font to check it. Comfortably below a page of text.
+const DEVANAGARI_OVERRIDE_MIN_ENTRIES: usize = 8;
+
+/// Share of a `/ToUnicode`'s glyphs the font must be able to name before its
+/// tables replace it. Just short of total, to tolerate a stray unmapped glyph.
+const DEVANAGARI_OVERRIDE_MIN_COVERAGE_PCT: usize = 95;
+
+fn build_fallback_cmap_for_type0(
+    font_dict: &lopdf::Dictionary,
+    doc: &Document,
+) -> Option<ToUnicodeCMap> {
+    let (cid_font_dict, program) = type0_descendant_and_program(font_dict, doc)?;
+
+    if let Some(data) = program {
+        if let Some(cmap) = build_cmap_from_truetype(&data) {
+            if let Some(cid_to_gid) = get_cid_to_gid_map(cid_font_dict, doc) {
+                if let Some(repaired) = build_cmap_with_cid_to_gid_map(&cmap, &cid_to_gid) {
                     debug!(
-                        "Fallback TrueType CMap (Type0+ToUnicode) char_map={}",
-                        cmap.char_map.len()
+                        "Fallback TrueType CMap repaired with CIDToGIDMap: {} entries",
+                        repaired.char_map.len()
                     );
-                    return Some(cmap);
+                    return Some(repaired);
                 }
             }
+            debug!(
+                "Fallback TrueType CMap (Type0+ToUnicode) char_map={}",
+                cmap.char_map.len()
+            );
+            return Some(cmap);
         }
     }
 

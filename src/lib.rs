@@ -36,6 +36,8 @@ pub mod detector;
 pub mod extractor;
 pub mod glyph_names;
 pub mod markdown;
+mod nepali;
+mod nepali_tables;
 pub mod process_mode;
 pub mod structure_tree;
 pub mod tables;

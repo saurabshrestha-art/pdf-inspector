@@ -1170,6 +1170,18 @@ pub(crate) fn extract_text_from_operand(
         .is_some_and(|info| info.is_cid);
     let use_cp1252_fallback =
         should_use_cp1252_single_byte_fallback(base_font_name, is_type0_cid_font);
+
+    // Legacy 8-bit Nepali fonts (Preeti and kin) store keyboard codes, not
+    // characters: the content-stream bytes ARE the layout. This runs ahead of
+    // every CMap path below and ignores any ToUnicode the file carries,
+    // because when these fonts ship one at all it maps to the Latin
+    // lookalikes — the exact mojibake we are here to undo.
+    if let Object::String(bytes, _) = obj {
+        if let Some(table) = base_font_name.and_then(crate::nepali::legacy_table) {
+            return Some(crate::nepali::decode_legacy(bytes, table));
+        }
+    }
+
     let result = (|| -> Option<String> {
         if let Object::String(bytes, _) = obj {
             let mut decode_with_entry = |entry: &crate::tounicode::CMapEntry| -> Option<String> {

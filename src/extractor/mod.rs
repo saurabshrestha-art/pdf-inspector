@@ -1135,6 +1135,17 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
         }
     }
 
+    // Legacy Nepali fonts are substituted byte-for-byte at decode time and only
+    // become well-formed Devanagari once whole words are assembled — a Nepali
+    // word routinely spans several text-show operators, and rewriting a
+    // fragment strands its matra on the wrong syllable. Assembly is what just
+    // happened, so this is the first point where the rewrites are safe to run.
+    for item in &mut merged {
+        if crate::nepali::legacy_table(&item.font).is_some() {
+            item.text = crate::nepali::apply_post_rules(&item.text);
+        }
+    }
+
     merged
 }
 
