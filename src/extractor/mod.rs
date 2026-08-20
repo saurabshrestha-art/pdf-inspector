@@ -976,6 +976,15 @@ fn trimmed_suffix(next: &TextItem) -> &str {
     next.text.trim()
 }
 
+/// A run holding nothing but combining marks — a matra the font drew as its
+/// own positioned item, carrying no advance of its own.
+fn is_combining_marks_only(text: &str) -> bool {
+    !text.trim().is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_whitespace() || crate::nepali::is_combining_mark(c))
+}
+
 pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     if items.is_empty() {
         return items;
@@ -1003,14 +1012,32 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
     for (page, y, mut group) in line_groups {
         let rtl = is_rtl_text(group.iter().map(|i| &i.text));
         let preserve_stream_order = !rtl && should_preserve_overlapping_stream_order(&group);
-        if rtl {
-            group.sort_by(|a, b| b.x.total_cmp(&a.x));
-            // Embedded LTR phrases must recover screen order before merging
-            // bakes the concatenation in — later sort_line_items passes can
-            // no longer separate a merged item.
-            crate::text_utils::restore_embedded_ltr_runs(&mut group, |i| i.text.as_str());
-        } else if !preserve_stream_order {
-            group.sort_by(|a, b| a.x.total_cmp(&b.x));
+        if !preserve_stream_order {
+            // A zero-advance combining mark is drawn at the pen position its
+            // base left behind, which can land a hair past the glyph drawn
+            // next: in `महसुल` the u-matra sits at x=334.87 and the following
+            // `ल` at x=334.51. Sorting on that 0.36pt puts the matra after the
+            // wrong letter and spells `महसलु`. The stream already has these in
+            // the right order, so a mark inherits the sort key of what precedes
+            // it and a stable sort keeps it there.
+            let mut keys: Vec<f32> = Vec::with_capacity(group.len());
+            for (index, item) in group.iter().enumerate() {
+                let inherits = index > 0 && is_combining_marks_only(&item.text);
+                keys.push(if inherits { keys[index - 1] } else { item.x });
+            }
+            let mut keyed: Vec<(f32, &TextItem)> = keys.into_iter().zip(group).collect();
+            if rtl {
+                keyed.sort_by(|a, b| b.0.total_cmp(&a.0));
+            } else {
+                keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
+            }
+            group = keyed.into_iter().map(|(_, item)| item).collect();
+            if rtl {
+                // Embedded LTR phrases must recover screen order before merging
+                // bakes the concatenation in — later sort_line_items passes can
+                // no longer separate a merged item.
+                crate::text_utils::restore_embedded_ltr_runs(&mut group, |i| i.text.as_str());
+            }
         }
         ordered_line_groups.push((page, y, group, preserve_stream_order));
     }
@@ -1118,7 +1145,13 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 }
                 text.push_str(&next.text);
                 let next_end = next.x + effective_merge_width(next);
-                end_x = if *preserve_stream_order {
+                // A combining mark carries no advance: it is drawn over the
+                // cluster it belongs to and leaves the pen where it found it.
+                // Letting it set the running edge measures every later gap on
+                // the line from the wrong place — behind the text if the mark
+                // sits back over its base, ahead of it if the font parks the
+                // mark at the cluster end, which swallows the following space.
+                end_x = if *preserve_stream_order || joins_combining_mark {
                     end_x.max(next_end)
                 } else {
                     next_end
